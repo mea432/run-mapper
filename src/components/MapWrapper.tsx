@@ -92,6 +92,275 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
   const trashAreaRef = useRef<HTMLDivElement>(null);
   const waypointMarkersRef = useRef<any[]>([]);
   const [isDraggingMarker, setIsDraggingMarker] = useState(false);
+  const clickTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Address search inside welcome popup
+  const [addressQuery, setAddressQuery] = useState('');
+  const [suggestions, setSuggestions] = useState<any[]>([]);
+  const debounceRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Share success state
+  const [shareCopied, setShareCopied] = useState(false);
+  const shareTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Loading indicator for long routes
+  const [isRouteLoading, setIsRouteLoading] = useState(false);
+  const [initialRouteLoaded, setInitialRouteLoaded] = useState(false);
+  const [spinnerShown, setSpinnerShown] = useState(false);
+
+  /* ---------------- Elevation profile ---------------- */
+  const [elevationProfile, setElevationProfile] = useState<number[] | null>(null);
+  const elevationCanvasRef = useRef<HTMLCanvasElement>(null);
+  const [showElevation, setShowElevation] = useState<boolean>(false);
+  const [elevationLoading, setElevationLoading] = useState(false);
+  const [elevationError, setElevationError] = useState(false);
+  const [hoverRatio, setHoverRatio] = useState<number | null>(null);
+  const [hoverElevation, setHoverElevation] = useState<number | null>(null);
+  const [hoverX, setHoverX] = useState<number | null>(null);
+  const [elevMin, setElevMin] = useState<number | null>(null);
+  const [elevMax, setElevMax] = useState<number | null>(null);
+  const [scaleMin, setScaleMin] = useState<number | null>(null);
+
+  // Store smoothed elevation data for higher resolution queries
+  const smoothedElevationRef = useRef<number[] | null>(null);
+
+  // Helper to fetch elevation data (sampled to max 512 points)
+  const fetchElevation = async (coords: [number, number][]) => {
+    if (!coords || coords.length < 2) return;
+    const maxSamples = 512;
+    const sampleStep = Math.max(1, Math.floor(coords.length / maxSamples));
+    const sampled = coords.filter((_, idx) => idx % sampleStep === 0);
+
+    // Split into chunks of 100 coordinates to avoid URL length limits
+    const chunkSize = 100;
+    const chunks = [];
+    for (let i = 0; i < sampled.length; i += chunkSize) {
+      chunks.push(sampled.slice(i, i + chunkSize));
+    }
+
+    setElevationLoading(true);
+    setElevationError(false);
+    
+    // Try each API in sequence with retries
+    const tryFetch = async (api: 'opentopodata' | 'openelevation', chunk: [number, number][], retries = 2): Promise<any> => {
+      for (let i = 0; i <= retries; i++) {
+        try {
+          const res = await fetch('/api/elevation', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ 
+              locations: chunk,
+              api
+            })
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return await res.json();
+        } catch (err) {
+          if (i === retries) throw err;
+          await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1))); // exponential backoff
+        }
+      }
+    };
+
+    try {
+      // Try Open Elevation first (more reliable)
+      const elevations: number[] = [];
+      for (const chunk of chunks) {
+        const json = await tryFetch('openelevation', chunk);
+        if (!json?.results) throw new Error('invalid response');
+        elevations.push(...json.results.map((r: any) => r.elevation ?? 0));
+      }
+
+      setElevationProfile(elevations);
+      setElevMin(Math.min(...elevations));
+      setElevMax(Math.max(...elevations));
+    } catch (err) {
+      console.warn('Primary elevation API failed:', err);
+      // Fallback to OpenTopoData API
+      try {
+        const elevations: number[] = [];
+        for (const chunk of chunks) {
+          const json = await tryFetch('opentopodata', chunk);
+          if (!json?.results) throw new Error('invalid response');
+          elevations.push(...json.results.map((r: any) => r.elevation ?? 0));
+        }
+        setElevationProfile(elevations);
+        setElevMin(Math.min(...elevations));
+        setElevMax(Math.max(...elevations));
+      } catch (err2) {
+        console.error('Both elevation APIs failed:', err2);
+        setElevationError(true);
+        setShowElevation(false);
+      }
+    } finally {
+      setElevationLoading(false);
+    }
+  };
+
+  // Draw elevation chart whenever profile updates
+  useEffect(() => {
+    if (!elevationProfile || !elevationCanvasRef.current) return;
+    const canvas = elevationCanvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    
+    // Set up canvas
+    const w = canvas.width = canvas.offsetWidth;
+    const h = canvas.height = canvas.offsetHeight;
+    const canvasPaddingLeft = 0; // flush graph to axis on the left
+    const canvasPaddingRight = 5; // small space on the right to avoid clipping
+    const padding = { top: 20, right: canvasPaddingRight, bottom: 20, left: canvasPaddingLeft };
+    const graphWidth = w - padding.left - padding.right;
+    const graphHeight = h - padding.top - padding.bottom;
+    
+    ctx.clearRect(0, 0, w, h);
+    
+    // -------- Create Catmull-Rom spline samples (smoothed data) --------
+    const rawMax = Math.max(...elevationProfile);
+    const rawMin = Math.min(...elevationProfile);
+    const rawRange = Math.max(1, rawMax - rawMin);
+
+    // Precompute control points once for Catmull-Rom to Bezier conversion
+    const getControlPoints = (vals: number[]) => {
+      const cps: {cp1: number; cp2: number}[] = [];
+      for (let i = 0; i < vals.length - 1; i++) {
+        const p0 = vals[Math.max(0, i - 1)];
+        const p1 = vals[i];
+        const p2 = vals[i + 1];
+        const p3 = vals[Math.min(vals.length - 1, i + 2)];
+        const tension = 0.33;
+        const cp1 = p1 + (p2 - p0) * tension / 2;
+        const cp2 = p2 - (p3 - p1) * tension / 2;
+        cps.push({cp1, cp2});
+      }
+      return cps;
+    };
+
+    const cps = getControlPoints(elevationProfile);
+
+    const sampleCount = 512;
+    const smoothed: number[] = [];
+    for (let s = 0; s < sampleCount; s++) {
+      const tGlobal = s / (sampleCount - 1);
+      const segFloat = tGlobal * (elevationProfile.length - 1);
+      const i = Math.min(elevationProfile.length - 2, Math.floor(segFloat));
+      const localT = segFloat - i;
+
+      const p1 = elevationProfile[i];
+      const p2 = elevationProfile[i + 1];
+      const cp1 = cps[i].cp1;
+      const cp2 = cps[i].cp2;
+
+      const oneMinusT = 1 - localT;
+      const val = oneMinusT**3 * p1 + 3*oneMinusT**2*localT*cp1 + 3*oneMinusT*localT**2*cp2 + localT**3*p2;
+      smoothed.push(val);
+    }
+
+    smoothedElevationRef.current = smoothed;
+
+    const minElev = Math.min(...smoothed);
+    const maxElev = Math.max(...smoothed);
+    // Set bottom of scale to 0 or slightly below if there are negative values
+    const scaleMin = minElev < 0 ? minElev * 1.1 : 0;
+    const range = Math.max(1, maxElev - scaleMin);
+
+    setElevMin(minElev);
+    setElevMax(maxElev);
+    setScaleMin(scaleMin);
+
+    // --------- Draw from smoothed data ---------
+    const gradient = ctx.createLinearGradient(0, padding.top, 0, h - padding.bottom);
+    gradient.addColorStop(0, 'rgba(33, 150, 243, 0.8)');
+    gradient.addColorStop(1, 'rgba(33, 150, 243, 0.2)');
+
+    const xStep = graphWidth / (sampleCount - 1);
+
+    // Filled area
+    ctx.beginPath();
+    ctx.moveTo(padding.left, h - padding.bottom);
+    smoothed.forEach((elev, idx) => {
+      const x = padding.left + idx * xStep;
+      const y = padding.top + graphHeight - ((elev - scaleMin) / range) * graphHeight;
+      ctx.lineTo(x, y);
+    });
+    ctx.lineTo(padding.left + graphWidth, h - padding.bottom);
+    ctx.closePath();
+    ctx.fillStyle = gradient;
+    ctx.fill();
+
+    // Stroke line
+    ctx.beginPath();
+    smoothed.forEach((elev, idx) => {
+      const x = padding.left + idx * xStep;
+      const y = padding.top + graphHeight - ((elev - scaleMin) / range) * graphHeight;
+      if (idx === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.strokeStyle = '#2196F3';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }, [elevationProfile]);
+
+  // Handle hover on elevation bar
+  const handleElevationHover = (clientX: number, bounding: DOMRect) => {
+    if (!elevationProfile || elevationProfile.length === 0) return;
+    if (!elevationCanvasRef.current) return;
+    const canvasRect = elevationCanvasRef.current.getBoundingClientRect();
+    const usableWidth = canvasRect.width; // full drawable width inside canvas
+    const xRel = clientX - canvasRect.left; // relative to canvas left edge
+
+    // Use smoothed sample grid to find exact index for perfect alignment
+    const smoothedLen = smoothedElevationRef.current?.length || 1;
+    const stepPx = usableWidth / (smoothedLen - 1);
+    let idx = Math.round(xRel / stepPx);
+    idx = Math.max(0, Math.min(smoothedLen - 1, idx));
+    const ratio = idx / (smoothedLen - 1);
+    const coordIndex = Math.floor(ratio * (routeCoordinatesRef.current.length - 1));
+    const coord = routeCoordinatesRef.current[coordIndex];
+    if (!coord) return;
+
+    // Ensure player marker visible on map
+    if (!playerMarkerRef.current) createPlayerMarker();
+    playerMarkerRef.current?.setLatLng(coord);
+
+    // Update hover UI states
+    setHoverRatio(ratio);
+    if (elevationProfile) {
+      if (smoothedElevationRef.current && smoothedElevationRef.current.length > 1) {
+        setHoverElevation(smoothedElevationRef.current[idx]);
+      } else {
+        const rawIdx = Math.floor(ratio * (elevationProfile.length - 1));
+        setHoverElevation(elevationProfile[rawIdx]);
+      }
+      // Compute absolute X position for vertical line: align with canvas left
+      const offset = canvasRect.left - bounding.left;
+      setHoverX(offset + idx * stepPx);
+    }
+  };
+
+  const searchAddress = async () => {
+    clearRoute();
+    if (!addressQuery.trim()) return;
+    try {
+      const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(addressQuery)}`);
+      const data = await res.json();
+      if (data && data.length > 0) {
+        const { lat, lon } = data[0];
+        const coords: [number, number] = [parseFloat(lat), parseFloat(lon)];
+        setPosition(coords);
+        if (mapRef.current) {
+          mapRef.current.setView(coords, 15);
+        }
+        setShowWelcomePopup(false);
+      } else {
+        alert('Location not found. Please try a different address.');
+      }
+    } catch (err) {
+      console.error(err);
+      alert('Error fetching location.');
+    }
+  };
 
   const canUndo = historyIndex > 0;
   const canRedo = historyIndex < history.length - 1;
@@ -104,13 +373,29 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
       const trimmed = prev.slice(0, historyIndex + 1);
       return [...trimmed, newWps];
     });
-    setHistoryIndex(prev => prev + 1);
+      setHistoryIndex(prev => prev + 1);
 
     // Update state
     setWaypoints(newWps);
 
     // Immediately update current routing control to avoid stale route before effect runs
-    routingControlRef.current?.setWaypoints(newWps.map(([lat,lng]) => L.latLng(lat,lng)));
+    const rc = routingControlRef.current;
+    if (rc) {
+      rc.setWaypoints(newWps.map(([lat,lng]) => L.latLng(lat,lng)));
+      // Explicitly trigger routing in case internal debounce delays execution
+      rc.route();
+    }
+
+    // If fewer than 2 waypoints remain, clear existing route visuals and info
+    if (newWps.length < 2) {
+      setRouteInfo(null);
+      // Remove custom gradient segments
+      routeSegmentsRef.current.forEach(seg => mapRef.current?.removeLayer(seg));
+      routeSegmentsRef.current = [];
+
+      // Clear stored route coordinates
+      routeCoordinatesRef.current = [];
+    }
   };
 
   const undo = () => {
@@ -143,6 +428,7 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
     // Reset history
     setHistory([[]]);
     setHistoryIndex(0);
+    setInitialRouteLoaded(false);
 
     // Remove player marker if present
     if(playerMarkerRef.current && mapRef.current){
@@ -165,7 +451,7 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
       alert('Geolocation is not supported by your browser.');
       return;
     }
-    navigator.geolocation.getCurrentPosition(
+      navigator.geolocation.getCurrentPosition(
       (pos) => {
         const coords: [number, number] = [pos.coords.latitude, pos.coords.longitude];
         setPosition(coords);
@@ -185,17 +471,23 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
 
   useEffect(() => {
     setIsMounted(true);
-    
-    // Get user's current position only in edit mode (not view-only)
-    if (!viewOnly && navigator.geolocation) {
-      navigator.geolocation.getCurrentPosition(
-        (position) => {
-          setPosition([position.coords.latitude, position.coords.longitude]);
-        },
-        (error) => {
-          console.error('Error getting location:', error);
-        }
-      );
+
+    // Fetch IP-based location to center map roughly on the user's country (edit mode only)
+    if (!viewOnly) {
+      fetch('https://ipapi.co/json/')
+        .then(res => res.json())
+        .then(data => {
+          if (data && data.latitude && data.longitude) {
+            const coords: [number, number] = [parseFloat(data.latitude), parseFloat(data.longitude)];
+            setPosition(coords);
+            if (mapRef.current) {
+              mapRef.current.setView(coords, 6); // Zoomed out to country-level
+            }
+          }
+        })
+        .catch(err => {
+          console.error('IP location fetch failed:', err);
+        });
     }
   }, [viewOnly]);
 
@@ -297,6 +589,9 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
       routeSegmentsRef.current.forEach(seg => mapRef.current?.removeLayer(seg));
       routeSegmentsRef.current = [];
       waypointMarkersRef.current = [];
+      if (viewOnly && !spinnerShown) {
+        setIsRouteLoading(true);
+      }
     });
 
     // Add hover effects to route segments
@@ -314,13 +609,31 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
         // Store route coordinates for animation
         routeCoordinatesRef.current = route.coordinates.map((coord: any) => [coord.lat, coord.lng]);
 
-        // Auto-fit the map to the full route when in view-only mode
+        // Auto-fit the map to the full route when in view-only mode.
+        // Defer the fit by a tick to ensure the route is fully added to the map,
+        // which is important for very long routes that take longer to render.
         if (viewOnly && mapRef.current) {
           const bounds = L.latLngBounds(route.coordinates);
-          mapRef.current.fitBounds(bounds, { 
-            padding: [60, 60]
-          });
+          setTimeout(() => {
+            if (mapRef.current) {
+              mapRef.current.fitBounds(bounds, { padding: [60, 60] });
+            }
+          }, 200); // slight delay (200 ms) guarantees layers are ready
         }
+        if (viewOnly && !spinnerShown) {
+          setIsRouteLoading(false);
+          setSpinnerShown(true);
+        }
+
+        fetchElevation(routeCoordinatesRef.current);
+      }
+    });
+
+    // Add routing error listener
+    routingControl.on('routingerror', () => {
+      if (viewOnly && !spinnerShown) {
+        setIsRouteLoading(false);
+        setSpinnerShown(true);
       }
     });
 
@@ -431,9 +744,15 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
     if (!isMounted || !mapRef.current || viewOnly) return;
 
     const clickHandler = (e: any) => {
+      // If a double-click is potentially occurring, defer single-click action
+      if (clickTimeoutRef.current) return;
+
+      clickTimeoutRef.current = setTimeout(() => {
       const clickPoint: [number, number] = [e.latlng.lat, e.latlng.lng];
-      const newWaypoints: [number, number][] = [...waypointsRef.current, clickPoint];
-      commitWaypoints(newWaypoints);
+        const newWaypoints: [number, number][] = [...waypointsRef.current, clickPoint];
+        commitWaypoints(newWaypoints);
+        clickTimeoutRef.current = null;
+      }, 250); // delay to distinguish from dblclick
     };
 
     mapRef.current.on('click', clickHandler);
@@ -441,6 +760,51 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
     return () => {
       if (mapRef.current) {
         mapRef.current.off('click', clickHandler);
+      }
+    };
+  }, [isMounted, waypoints, viewOnly]);
+
+  // Double-click to insert waypoint on nearest segment
+  useEffect(() => {
+    if (!isMounted || !mapRef.current || viewOnly) return;
+
+    // Disable default zoom on double-click to reuse for insertion
+    if (mapRef.current.doubleClickZoom) {
+      mapRef.current.doubleClickZoom.disable();
+    }
+
+    const dblClickHandler = (e: any) => {
+      // Cancel pending single-click action
+      if (clickTimeoutRef.current) {
+        clearTimeout(clickTimeoutRef.current);
+        clickTimeoutRef.current = null;
+      }
+
+      const clickPoint: [number, number] = [e.latlng.lat, e.latlng.lng];
+      const wps = waypointsRef.current;
+      if (wps.length < 2) return;
+
+      let minDist = Infinity;
+      let bestIdx = 1;
+      for (let i = 0; i < wps.length - 1; i++) {
+        const dist = distanceToSegment(clickPoint, wps[i], wps[i + 1]);
+        if (dist < minDist) {
+          minDist = dist;
+          bestIdx = i + 1;
+        }
+      }
+
+      const insertIndex = bestIdx;
+      const newWaypoints = [...waypointsRef.current];
+      newWaypoints.splice(insertIndex, 0, clickPoint);
+      commitWaypoints(newWaypoints);
+    };
+
+    mapRef.current.on('dblclick', dblClickHandler);
+
+    return () => {
+      if (mapRef.current) {
+        mapRef.current.off('dblclick', dblClickHandler);
       }
     };
   }, [isMounted, waypoints, viewOnly]);
@@ -486,7 +850,7 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
     }
 
     const marker = L.divIcon({
-      className: 'custom-waypoint-marker draggable-waypoint',
+      className: viewOnly ? 'custom-waypoint-marker' : 'custom-waypoint-marker draggable-waypoint',
       html: `
         <div style="
           background-color: ${backgroundColor};
@@ -501,7 +865,7 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
           font-size: 12px;
           border: 2px solid white;
           box-shadow: 0 2px 4px rgba(0,0,0,0.2);
-          cursor: move;
+          cursor: ${viewOnly ? 'default' : 'move'} !important;
         ">
           ${waypointIndex + 1}
         </div>
@@ -511,7 +875,7 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
     });
     return L.marker([0, 0], { 
       icon: marker,
-      draggable: true
+      draggable: !viewOnly
     });
   };
 
@@ -562,7 +926,7 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
     if(!startTimeRef.current){startTimeRef.current=timestamp;}
     const elapsed=timestamp-startTimeRef.current;
     const newProgress=Math.min(elapsed/(duration*1000),1);
-    setProgress(newProgress);
+      setProgress(newProgress);
 
     const coords=routeCoordinatesRef.current;
     if(coords.length<2){return;}
@@ -580,13 +944,13 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
     }
 
     if(newProgress<1){animationFrameRef.current=requestAnimationFrame(animateRoute);}else{
-        setIsPlaying(false);
-        setProgress(0);
+      setIsPlaying(false);
+      setProgress(0);
         startTimeRef.current=undefined;
-        if (playerMarkerRef.current && mapRef.current) {
-          mapRef.current.removeLayer(playerMarkerRef.current);
-          playerMarkerRef.current = null;
-        }
+      if (playerMarkerRef.current && mapRef.current) {
+        mapRef.current.removeLayer(playerMarkerRef.current);
+        playerMarkerRef.current = null;
+      }
 
         // Restore waypoint markers
         waypointMarkersRef.current.forEach(m=>m.setOpacity(1));
@@ -681,11 +1045,87 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
 
     // Copy to clipboard
     navigator.clipboard.writeText(shareUrl).then(() => {
-      alert('Share link copied to clipboard!');
+      setShareCopied(true);
+      if (shareTimeoutRef.current) clearTimeout(shareTimeoutRef.current);
+      shareTimeoutRef.current = setTimeout(() => setShareCopied(false), 2000);
     }).catch(err => {
       console.error('Failed to copy:', err);
       alert('Failed to copy share link. Please try again.');
     });
+  };
+
+  // Clear timeout on unmount
+  useEffect(() => {
+    return () => {
+      if (shareTimeoutRef.current) clearTimeout(shareTimeoutRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (addressQuery.trim().length < 3) {
+      setSuggestions([]);
+      return;
+    }
+
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+
+    debounceRef.current = setTimeout(async () => {
+      try {
+        const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&addressdetails=1&q=${encodeURIComponent(addressQuery)}&limit=5`);
+        const data = await res.json();
+        setSuggestions(data);
+      } catch (err) {
+        console.error(err);
+      }
+    }, 300);
+  }, [addressQuery]);
+
+  const selectSuggestion = (item: any) => {
+    setAddressQuery(item.display_name);
+    setSuggestions([]);
+    const coords: [number, number] = [parseFloat(item.lat), parseFloat(item.lon)];
+    setPosition(coords);
+    if (mapRef.current) {
+      mapRef.current.setView(coords, 15);
+    }
+    setShowWelcomePopup(false);
+  };
+
+  // Hide elevation profile when profile data is cleared
+  useEffect(() => {
+    if (!elevationProfile) {
+      setShowElevation(false);
+    }
+  }, [elevationProfile]);
+
+  // Helper to calculate nice tick intervals
+  const calculateTicks = (min: number, max: number, targetCount: number = 5): number[] => {
+    const range = max - min;
+    const roughStep = range / (targetCount - 1);
+    
+    // Nice step values
+    const steps = [1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 2500, 5000];
+    let step = steps[0];
+    
+    // Find the first step size that gives us at most targetCount ticks
+    for (const s of steps) {
+      if (range / s <= targetCount) {
+        step = s;
+        break;
+      }
+    }
+
+    // Calculate the nice min and max values
+    const niceMin = Math.floor(min / step) * step;
+    const niceMax = Math.ceil(max / step) * step;
+    
+    // Generate ticks
+    const ticks: number[] = [];
+    for (let tick = niceMin; tick <= niceMax; tick += step) {
+      ticks.push(tick);
+    }
+    
+    return ticks;
   };
 
   if (!isMounted) {
@@ -703,6 +1143,10 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
         }
         .draggable-waypoint:hover {
           cursor: move !important;
+        }
+        @keyframes spin {
+          0% { transform: rotate(0deg); }
+          100% { transform: rotate(360deg); }
         }
       `}} />
       
@@ -784,6 +1228,88 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
               <strong style={{ color: '#2196F3' }}>Use My Location</strong> to automatically set your current location.
             </li>
           </ul>
+
+          {/* Address search */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+            <label style={{ fontSize: 'clamp(13px, 2.5vw, 15px)', fontWeight: 500, color: '#4a5568', fontFamily: 'var(--font-geist-sans)' }}>
+              Jump to an address
+            </label>
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <input
+                type="text"
+                value={addressQuery}
+                onChange={(e) => setAddressQuery(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') searchAddress(); }}
+                placeholder="1600 Amphitheatre Pkwy, Mountain View"
+                style={{
+                  flex: 1,
+                  padding: '10px 12px',
+                  border: '1px solid #ccc',
+                  borderRadius: '8px',
+                  fontSize: 'clamp(14px, 3vw, 16px)',
+                  fontFamily: 'var(--font-geist-sans)'
+                }}
+              />
+          <button
+                onClick={searchAddress}
+            style={{
+              padding: '10px 20px',
+                  backgroundColor: '#4CAF50',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '8px',
+                  cursor: 'pointer',
+                  fontSize: 'clamp(14px, 3vw, 16px)',
+                  fontWeight: '500',
+                  transition: 'background-color 0.2s',
+                  fontFamily: 'var(--font-geist-sans)'
+                }}
+                onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = '#43A047')}
+                onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = '#4CAF50')}
+              >
+                Go
+              </button>
+            </div>
+
+            {suggestions.length > 0 && (
+              <ul
+                style={{
+                  listStyle: 'none',
+                  margin: 0,
+                  padding: 0,
+                  maxHeight: '150px',
+                  overflowY: 'auto',
+                  border: '1px solid #e0e0e0',
+                  borderRadius: '8px',
+                  backgroundColor: 'white',
+                  boxShadow: '0 2px 6px rgba(0,0,0,0.1)'
+                }}
+              >
+                {suggestions.map((s, idx) => (
+                  <li
+                    key={idx}
+                    onClick={() => selectSuggestion(s)}
+                    style={{
+                      padding: '10px 12px',
+                      cursor: 'pointer',
+                      fontSize: 'clamp(13px, 2.5vw, 15px)',
+                      fontFamily: 'var(--font-geist-sans)',
+                      borderBottom: idx !== suggestions.length - 1 ? '1px solid #f0f0f0' : 'none'
+                    }}
+                    onMouseEnter={(e) => {
+                      (e.currentTarget as HTMLLIElement).style.backgroundColor = '#f5f5f5';
+                    }}
+                    onMouseLeave={(e) => {
+                      (e.currentTarget as HTMLLIElement).style.backgroundColor = 'white';
+                    }}
+                  >
+                    {s.display_name}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+
           <div style={{
             display: 'flex',
             gap: '12px',
@@ -797,11 +1323,11 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
               }}
               style={{
                 padding: '12px 20px',
-                backgroundColor: '#2196F3',
-                color: 'white',
-                border: 'none',
+              backgroundColor: '#2196F3',
+              color: 'white',
+              border: 'none',
                 borderRadius: '8px',
-                cursor: 'pointer',
+              cursor: 'pointer',
                 fontSize: 'clamp(14px, 3vw, 16px)',
                 fontWeight: '500',
                 flex: 1,
@@ -835,13 +1361,13 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
               onMouseLeave={(e) => e.currentTarget.style.backgroundColor = '#f5f5f5'}
             >
               Skip
-            </button>
+          </button>
           </div>
         </div>
       )}
 
       {!viewOnly && (
-        <div style={{ position: 'absolute', top: '10px', right: '10px', zIndex: 1000, display: 'flex', gap: '10px' }}>
+      <div style={{ position: 'absolute', top: '10px', right: '10px', zIndex: 1000, display: 'flex', gap: '10px' }}>
           <button
             onClick={shareRoute}
             style={{
@@ -858,20 +1384,35 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
               gap: '8px'
             }}
           >
-            <svg 
-              width="16" 
-              height="16" 
-              viewBox="0 0 24 24" 
-              fill="none" 
-              stroke="currentColor" 
-              strokeWidth="2" 
-              strokeLinecap="round" 
-              strokeLinejoin="round"
-            >
-              <path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"></path>
-              <polyline points="16 6 12 2 8 6"></polyline>
-              <line x1="12" y1="2" x2="12" y2="15"></line>
-            </svg>
+            {shareCopied ? (
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+            ) : (
+              <svg 
+                width="16" 
+                height="16" 
+                viewBox="0 0 24 24" 
+                fill="none" 
+                stroke="currentColor" 
+                strokeWidth="2" 
+                strokeLinecap="round" 
+                strokeLinejoin="round"
+              >
+                <path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"></path>
+                <polyline points="16 6 12 2 8 6"></polyline>
+                <line x1="12" y1="2" x2="12" y2="15"></line>
+              </svg>
+            )}
           </button>
           <button
             onClick={clearRoute}
@@ -888,42 +1429,42 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
           >
             Clear Route
           </button>
-          <button
-            onClick={undo}
-            disabled={!canUndo}
-            style={{
-              padding: '10px 20px',
-              backgroundColor: canUndo ? '#4CAF50' : '#cccccc',
-              color: 'white',
-              border: 'none',
-              borderRadius: '4px',
-              cursor: canUndo ? 'pointer' : 'not-allowed',
+        <button
+          onClick={undo}
+          disabled={!canUndo}
+          style={{
+            padding: '10px 20px',
+            backgroundColor: canUndo ? '#4CAF50' : '#cccccc',
+            color: 'white',
+            border: 'none',
+            borderRadius: '4px',
+            cursor: canUndo ? 'pointer' : 'not-allowed',
               opacity: canUndo ? 1 : 0.6
-            }}
-          >
-            Undo
-          </button>
-          <button
-            onClick={redo}
-            disabled={!canRedo}
-            style={{
-              padding: '10px 20px',
-              backgroundColor: canRedo ? '#2196F3' : '#cccccc',
-              color: 'white',
-              border: 'none',
-              borderRadius: '4px',
-              cursor: canRedo ? 'pointer' : 'not-allowed',
+          }}
+        >
+          Undo
+        </button>
+        <button
+          onClick={redo}
+          disabled={!canRedo}
+          style={{
+            padding: '10px 20px',
+            backgroundColor: canRedo ? '#2196F3' : '#cccccc',
+            color: 'white',
+            border: 'none',
+            borderRadius: '4px',
+            cursor: canRedo ? 'pointer' : 'not-allowed',
               opacity: canRedo ? 1 : 0.6
-            }}
-          >
-            Redo
-          </button>
+          }}
+        >
+          Redo
+        </button>
           <select
             value={mapStyle}
             onChange={(e) => setMapStyle(e.target.value as 'standard' | 'satellite' | 'terrain')}
-            style={{
+          style={{
               padding: '10px',
-              borderRadius: '4px',
+            borderRadius: '4px',
               border: '1px solid #ccc',
               backgroundColor: 'white',
               cursor: 'pointer'
@@ -938,30 +1479,30 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
 
       {/* Always show map style selector in a different position when in view-only mode */}
       {viewOnly && (
-        <div style={{ position: 'absolute', top: '10px', right: '10px', zIndex: 1000 }}>
-          <select
-            value={mapStyle}
-            onChange={(e) => setMapStyle(e.target.value as 'standard' | 'satellite' | 'terrain')}
-            style={{
-              padding: '10px',
-              borderRadius: '4px',
-              border: '1px solid #ccc',
-              backgroundColor: 'white',
-              cursor: 'pointer'
-            }}
-          >
-            <option value="standard">Standard Map</option>
-            <option value="satellite">Satellite</option>
-            <option value="terrain">Terrain</option>
-          </select>
-        </div>
+        <div style={{ position: 'absolute', top: '20px', right: '10px', zIndex: 1000 }}>
+        <select
+          value={mapStyle}
+          onChange={(e) => setMapStyle(e.target.value as 'standard' | 'satellite' | 'terrain')}
+          style={{
+            padding: '10px',
+            borderRadius: '4px',
+            border: '1px solid #ccc',
+            backgroundColor: 'white',
+            cursor: 'pointer'
+          }}
+        >
+          <option value="standard">Standard Map</option>
+          <option value="satellite">Satellite</option>
+          <option value="terrain">Terrain</option>
+        </select>
+      </div>
       )}
 
       {routeInfo && (
         <div 
           style={{ 
             position: 'absolute', 
-            top: '60px', 
+            top: '70px', 
             right: '10px', 
             zIndex: 1000,
             backgroundColor: 'white',
@@ -1023,7 +1564,7 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
       {routeInfo && (
         <div style={{
           position: 'absolute',
-          bottom: '20px',
+          bottom: showElevation ? '220px' : '20px',
           left: '50%',
           transform: 'translateX(-50%)',
           backgroundColor: 'white',
@@ -1034,7 +1575,8 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
           display: 'flex',
           alignItems: 'center',
           gap: '15px',
-          minWidth: '300px'
+          minWidth: '300px',
+          transition: 'bottom 0.3s',
         }}>
           <button
             onClick={togglePlay}
@@ -1092,13 +1634,39 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
         </div>
       )}
 
+      {/* Elevation Toggle Button (only when profile exists) */}
+      {routeCoordinatesRef.current.length > 1 && (
+        <button
+          onClick={() => {
+            if (elevationLoading || elevationError) return;
+            setShowElevation(!showElevation);
+          }}
+          style={{
+            position: 'absolute',
+            bottom: showElevation ? '220px' : '20px',
+            left: '20px',
+            transform: 'none',
+            padding: '8px 14px',
+            backgroundColor: elevationLoading || elevationError ? '#888' : '#2196F3',
+            color: 'white',
+            border: 'none',
+            borderRadius: '20px',
+            cursor: elevationLoading || elevationError ? 'not-allowed' : 'pointer',
+            zIndex: 1000,
+            transition: 'bottom 0.3s'
+          }}
+        >
+          {elevationLoading ? 'Loading...' : elevationError ? 'Elev. Unavailable' : showElevation ? 'Hide Elevation' : 'Show Elevation'}
+        </button>
+      )}
+
       {/* Trash can area - only show when dragging a marker */}
       {isDraggingMarker && (
         <div
           ref={trashAreaRef}
           style={{
             position: 'absolute',
-            bottom: '20px',
+            bottom: showElevation ? '220px' : '20px',
             right: '20px',
             width: '120px',
             height: '120px',
@@ -1124,6 +1692,227 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
           <div style={{ color: '#ff4444', fontSize: '14px', fontWeight: 'bold' }}>
             Delete
           </div>
+        </div>
+      )}
+
+      {/* Loading indicator for long routes */}
+      {viewOnly && isRouteLoading && !spinnerShown && (
+        <>
+          <div style={{
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            width: '100%',
+            height: '100%',
+            backgroundColor: 'rgba(0,0,0,0.25)',
+            backdropFilter: 'blur(3px)',
+            zIndex: 1499,
+            pointerEvents: 'none'
+          }} />
+          <div style={{
+            position: 'absolute',
+            top: '50%',
+            left: '50%',
+            transform: 'translate(-50%, -50%)',
+            width: '48px',
+            height: '48px',
+            border: '6px solid #e0e0e0',
+            borderTop: '6px solid #2196F3',
+            borderRadius: '50%',
+            animation: 'spin 1s linear infinite',
+            zIndex: 1500,
+            pointerEvents: 'none'
+          }} />
+        </>
+      )}
+
+      {/* Elevation Profile Bar */}
+      {elevationProfile && elevationProfile.length > 1 && (
+        <div style={{
+          position: 'absolute',
+          bottom: showElevation ? '0px' : '-500px',
+          left: 0,
+          width: '100%',
+          height: '180px',
+          backgroundColor: 'white',
+          borderTop: '1px solid #e0e0e0',
+          boxShadow: '0 -2px 10px rgba(0,0,0,0.1)',
+          zIndex: 999,
+          display: 'flex',
+          alignItems: 'center',
+          transition: 'bottom 0.3s',
+          padding: '15px',
+          overflow: 'hidden'
+        }}
+          onMouseMove={(e) => {
+            const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect();
+            handleElevationHover(e.clientX, rect);
+          }}
+          onTouchMove={(e) => {
+            if (e.touches.length > 0) {
+              const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect();
+              handleElevationHover(e.touches[0].clientX, rect);
+            }
+          }}
+          onMouseLeave={() => {
+            setHoverRatio(null);
+            setHoverX(null);
+            if (playerMarkerRef.current && mapRef.current && !isPlaying) {
+              mapRef.current.removeLayer(playerMarkerRef.current);
+              playerMarkerRef.current = null;
+            }
+          }}
+          onTouchEnd={() => {
+            setHoverRatio(null);
+            setHoverX(null);
+            if (playerMarkerRef.current && mapRef.current && !isPlaying) {
+              mapRef.current.removeLayer(playerMarkerRef.current);
+              playerMarkerRef.current = null;
+            }
+          }}
+        >
+          {/* Axis */}
+          <div style={{ 
+            width: '60px', 
+            height: '120px',
+            marginRight: '10px',
+            position: 'relative',
+            display: 'flex',
+            flexDirection: 'column',
+            justifyContent: 'space-between',
+            borderRight: '1px solid #e0e0e0'
+          }}>
+            {/* Y-axis label */}
+            <div style={{ 
+              position: 'absolute',
+              left: '-42px',
+              top: '50%',
+              transform: 'rotate(-90deg) translateX(50%)',
+              transformOrigin: 'right',
+              color: '#666',
+              fontSize: '12px',
+              whiteSpace: 'nowrap',
+              fontWeight: '500'
+            }}>
+              Elevation {useMiles ? '(ft)' : '(m)'}
+            </div>
+
+            {/* Ticks container */}
+            <div style={{
+              position: 'absolute',
+              right: '0',
+              top: '0',
+              bottom: '0',
+              width: '100%'
+            }}>
+              {elevMax !== null && scaleMin !== null && (
+                <>
+                  {calculateTicks(scaleMin, elevMax).map((tick) => {
+                    const percent = 1 - (tick - scaleMin) / (elevMax - scaleMin);
+                    return (
+                      <div
+                        key={tick}
+                        style={{
+                          position: 'absolute',
+                          right: '0',
+                          top: `${percent * 100}%`,
+                          width: '100%',
+                          transform: 'translateY(-50%)',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'flex-end'
+                        }}
+                      >
+                        {/* Tick line */}
+                        <div style={{
+                          width: '4px',
+                          height: '1px',
+                          backgroundColor: '#ccc',
+                          marginRight: '4px'
+                        }} />
+                        {/* Tick label */}
+                        <span style={{
+                          fontSize: '10px',
+                          color: '#666',
+                          marginRight: '8px',
+                          fontFeatureSettings: '"tnum" 1',
+                          fontFamily: 'monospace'
+                        }}>
+                          {useMiles 
+                            ? `${Math.round(tick * 3.28084)}` 
+                            : `${Math.round(tick)}`
+                          }
+                        </span>
+                      </div>
+                    );
+                  })}
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* Graph area */}
+          <div style={{ 
+            flex: 1, 
+            height: '120px', 
+            position: 'relative',
+            backgroundColor: '#fafafa',
+            borderRadius: '4px'
+          }}>
+            <canvas ref={elevationCanvasRef} style={{ 
+              width: '100%', 
+              height: '100%',
+              borderRadius: '4px'
+            }} />
+            
+            {/* Distance axis label */}
+            <div style={{
+              position: 'absolute',
+              bottom: '-24px',
+              left: '0',
+              width: '100%',
+              textAlign: 'center',
+              color: '#666',
+              fontSize: '12px',
+              fontWeight: '500'
+            }}>
+              Distance {useMiles ? '(mi)' : '(km)'}
+            </div>
+          </div>
+
+          {/* Rest of the hover elements remain unchanged */}
+          {hoverRatio !== null && hoverElevation !== null && (
+            <>
+              <div style={{
+                position: 'absolute',
+                left: `${hoverX ?? 0}px`,
+                top: '15px',
+                width: '1px',
+                height: 'calc(100% - 30px)',
+                backgroundColor: 'rgba(33, 150, 243, 0.5)',
+                pointerEvents: 'none'
+              }} />
+              <div style={{
+                position: 'absolute',
+                left: `${hoverX ?? 0}px`,
+                top: '5px',
+                transform: 'translate(-50%, 0)',
+                backgroundColor: 'rgba(33, 150, 243, 0.9)',
+                color: '#fff',
+                padding: '4px 8px',
+                borderRadius: '4px',
+                fontSize: '12px',
+                whiteSpace: 'nowrap',
+                pointerEvents: 'none',
+                boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
+              }}>
+                {useMiles 
+                  ? `${Math.round(hoverElevation * 3.28084)} ft` 
+                  : `${Math.round(hoverElevation)} m`
+                }
+              </div>
+            </>
+          )}
         </div>
       )}
     </div>
