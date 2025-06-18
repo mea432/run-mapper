@@ -714,145 +714,127 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
           left: '50%',
           transform: 'translate(-50%, -50%)',
           backgroundColor: 'white',
-          padding: '40px',
+          padding: '20px',
           borderRadius: '16px',
           boxShadow: '0 10px 25px rgba(0,0,0,0.1)',
           zIndex: 2000,
-          maxWidth: '550px',
-          width: '90%',
+          maxWidth: '90%',
+          width: 'min(550px, 90vw)',
           maxHeight: '90vh',
-          overflowY: 'auto'
+          overflowY: 'auto',
+          WebkitOverflowScrolling: 'touch', // Smooth scrolling on iOS
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '16px'
         }}>
           <h2 style={{ 
-            marginTop: 0, 
+            margin: 0, 
             color: '#2196F3',
-            fontSize: '28px',
+            fontSize: 'clamp(24px, 5vw, 28px)',
             fontWeight: '600',
-            marginBottom: '20px',
             fontFamily: 'var(--font-geist-sans)'
           }}>
             Welcome to Route Planner!
           </h2>
           <p style={{ 
-            fontSize: '16px', 
+            fontSize: 'clamp(14px, 3vw, 16px)', 
             lineHeight: '1.6',
             color: '#4a5568',
-            marginBottom: '24px',
+            margin: 0,
             fontFamily: 'var(--font-geist-sans)'
           }}>
             Create and plan your running and biking routes with ease. Here's what you can do:
           </p>
           <ul style={{ 
             paddingLeft: '24px',
-            fontSize: '15px',
+            fontSize: 'clamp(13px, 2.5vw, 15px)',
             lineHeight: '1.8',
-            marginBottom: '28px',
+            margin: 0,
             color: '#4a5568',
-            fontFamily: 'var(--font-geist-sans)'
+            fontFamily: 'var(--font-geist-sans)',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '12px'
           }}>
-            <li style={{ marginBottom: '12px' }}>
+            <li>
               <strong style={{ color: '#2196F3' }}>Click anywhere</strong> on the map to add waypoints and build your route.
             </li>
-            <li style={{ marginBottom: '12px' }}>
+            <li>
               <strong style={{ color: '#2196F3' }}>Drag waypoints</strong> to fine-tune the path in real time.
             </li>
-            <li style={{ marginBottom: '12px' }}>
+            <li>
               <strong style={{ color: '#2196F3' }}>Undo / Redo</strong> with the green/blue buttons if you change your mind.
             </li>
-            <li style={{ marginBottom: '12px' }}>
+            <li>
               The route is drawn with a <strong style={{ color: '#2196F3' }}>blue → light-blue gradient</strong> so overlaps are clear.
             </li>
-            <li style={{ marginBottom: '12px' }}>
+            <li>
               Press <strong style={{ color: '#2196F3' }}>Play</strong> to watch an orange dot animate along the route.
             </li>
-            <li style={{ marginBottom: '12px' }}>
-              Scroll to <strong style={{ color: '#2196F3' }}>zoom smoothly</strong>; the map auto-fits the route at playback start.
+            <li>
+              Scroll to <strong style={{ color: '#2196F3' }}>zoom</strong>; the map auto-fits the route at playback start.
             </li>
-            <li style={{ marginBottom: '12px' }}>
+            <li>
               <strong style={{ color: '#2196F3' }}>Switch map style</strong>: Standard • Satellite • Terrain.
             </li>
-            <li style={{ marginBottom: '12px' }}>
+            <li>
               Click the distance badge to toggle <strong style={{ color: '#2196F3' }}>km / miles</strong>.
             </li>
-            <li style={{ marginBottom: '12px' }}>
+            <li>
               <strong style={{ color: '#2196F3' }}>Use My Location</strong> to automatically set your current location.
             </li>
           </ul>
-          <p style={{ 
-            fontSize: '14px', 
-            color: '#718096', 
-            marginBottom: '28px',
-            lineHeight: '1.6',
-            padding: '16px',
-            backgroundColor: '#f8fafc',
-            borderRadius: '8px',
-            fontFamily: 'var(--font-geist-sans)'
+          <div style={{
+            display: 'flex',
+            gap: '12px',
+            marginTop: '8px'
           }}>
-            The route will automatically follow walkable paths and trails for the most realistic experience. 
-            You can also play the route by clicking the play button. This website works best on desktop.
-          </p>
-          <div style={{ display: 'flex', gap: '12px', flexDirection: 'column' }}>
             <button
               onClick={() => {
-                requestUserLocation();
-                setWaypoints([]);
-                setRouteInfo(null);
                 setShowWelcomePopup(false);
+                requestUserLocation();
+                clearRoute();
               }}
               style={{
-                padding: '14px 20px',
+                padding: '12px 20px',
                 backgroundColor: '#2196F3',
                 color: 'white',
                 border: 'none',
                 borderRadius: '8px',
                 cursor: 'pointer',
-                fontSize: '16px',
-                width: '100%',
+                fontSize: 'clamp(14px, 3vw, 16px)',
                 fontWeight: '500',
-                transition: 'all 0.2s ease',
-                boxShadow: '0 2px 4px rgba(33, 150, 243, 0.2)',
+                flex: 1,
+                transition: 'background-color 0.2s',
                 fontFamily: 'var(--font-geist-sans)'
               }}
-              onMouseEnter={(e) => {
-                e.currentTarget.style.backgroundColor = '#1976D2';
-                e.currentTarget.style.transform = 'translateY(-1px)';
-                e.currentTarget.style.boxShadow = '0 4px 6px rgba(33, 150, 243, 0.25)';
-              }}
-              onMouseLeave={(e) => {
-                e.currentTarget.style.backgroundColor = '#2196F3';
-                e.currentTarget.style.transform = 'translateY(0)';
-                e.currentTarget.style.boxShadow = '0 2px 4px rgba(33, 150, 243, 0.2)';
-              }}
+              onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#1976D2'}
+              onMouseLeave={(e) => e.currentTarget.style.backgroundColor = '#2196F3'}
             >
               Use My Location
             </button>
             <button
               onClick={() => {
-                setWaypoints([]);
-                setRouteInfo(null);
                 setShowWelcomePopup(false);
+                clearRoute();
               }}
               style={{
-                padding: '14px 20px',
-                backgroundColor: '#ffffff',
-                color: '#2196F3',
-                border: '2px solid #2196F3',
+                padding: '12px 20px',
+                backgroundColor: '#f5f5f5',
+                color: '#333',
+                border: 'none',
                 borderRadius: '8px',
                 cursor: 'pointer',
-                fontSize: '16px',
-                width: '100%',
+                fontSize: 'clamp(14px, 3vw, 16px)',
                 fontWeight: '500',
-                transition: 'all 0.2s ease',
+                flex: 1,
+                transition: 'background-color 0.2s',
                 fontFamily: 'var(--font-geist-sans)'
               }}
-              onMouseEnter={(e) => {
-                e.currentTarget.style.backgroundColor = '#f8fafc';
-              }}
-              onMouseLeave={(e) => {
-                e.currentTarget.style.backgroundColor = '#ffffff';
-              }}
+              onMouseEnter={(e) => e.currentTarget.style.backgroundColor = '#e0e0e0'}
+              onMouseLeave={(e) => e.currentTarget.style.backgroundColor = '#f5f5f5'}
             >
-              Get Started
+              Skip
             </button>
           </div>
         </div>
@@ -890,7 +872,6 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
               <polyline points="16 6 12 2 8 6"></polyline>
               <line x1="12" y1="2" x2="12" y2="15"></line>
             </svg>
-            Share Route
           </button>
           <button
             onClick={clearRoute}
