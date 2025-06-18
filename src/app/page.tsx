@@ -1,31 +1,34 @@
 'use client';
 
-import dynamic from 'next/dynamic';
+import { Suspense } from 'react';
 import { useSearchParams } from 'next/navigation';
+import dynamic from 'next/dynamic';
 
 // Dynamically import MapWrapper with no SSR
-const MapWrapper = dynamic(() => import('../components/MapWrapper'), {
-  ssr: false,
-});
+const MapWrapper = dynamic(() => import('@/components/MapWrapper'), { ssr: false });
 
-export default function Home() {
+function HomeContent() {
   const searchParams = useSearchParams();
-  const routeData = searchParams.get('route');
+  const routeParam = searchParams.get('route');
   
-  let initialWaypoints: [number, number][] = [];
-  if (routeData) {
+  let waypoints: [number, number][] = [];
+  if (routeParam) {
     try {
       // Decode and parse the route data
-      const decoded = decodeURIComponent(routeData);
-      initialWaypoints = JSON.parse(decoded);
-    } catch (error) {
-      console.error('Failed to parse route data:', error);
+      waypoints = JSON.parse(decodeURIComponent(routeParam));
+    } catch (e) {
+      console.error('Error parsing route:', e);
     }
   }
 
+  return <MapWrapper initialWaypoints={waypoints} />;
+}
+
+export default function HomePage() {
   return (
-    <main>
-      <MapWrapper initialWaypoints={initialWaypoints} />
-    </main>
+    <Suspense fallback={<div>Loading map...</div>}>
+      <HomeContent />
+    </Suspense>
   );
 }
+
