@@ -1,24 +1,42 @@
 import L from 'leaflet';
 
+// Add smooth wheel zoom to Leaflet
+declare module 'leaflet' {
+  interface Map {
+    smoothWheelZoom: L.Handler;
+  }
+}
+
+interface SmoothWheelZoomHandler extends L.Handler {
+  _map: L.Map;
+  _onWheelScroll(e: Event): void;
+}
+
 L.Map.mergeOptions({
     smoothWheelZoom: true,
     smoothSensitivity: 1
 });
 
-L.Map.SmoothWheelZoom = L.Handler.extend({
-    addHooks: function () {
-        L.DomEvent.on(this._map._container, 'wheel', this._onWheelScroll, this);
+// Create a custom handler for smooth wheel zoom
+const SmoothWheelZoom = L.Handler.extend({
+    addHooks: function (this: SmoothWheelZoomHandler) {
+        L.DomEvent.on(this._map.getContainer(), 'wheel', this._onWheelScroll, this);
     },
 
-    removeHooks: function () {
-        L.DomEvent.off(this._map._container, 'wheel', this._onWheelScroll, this);
+    removeHooks: function (this: SmoothWheelZoomHandler) {
+        L.DomEvent.off(this._map.getContainer(), 'wheel', this._onWheelScroll, this);
     },
 
-    _onWheelScroll: function (e) {
-        if (!this._isWheeling) {
-            this._onWheelStart(e);
-        }
-        this._onWheeling(e);
+    _onWheelScroll: function (this: SmoothWheelZoomHandler, e: Event) {
+        if (!this._map) return;
+
+        const wheelEvent = e as WheelEvent;
+        const delta = L.DomEvent.getWheelDelta(wheelEvent);
+        const zoom = this._map.getZoom();
+        const newZoom = zoom + delta * 0.1;
+
+        this._map.setZoom(newZoom, { animate: true });
+        L.DomEvent.preventDefault(e);
     },
 
     _onWheelStart: function (e) {
@@ -94,6 +112,7 @@ L.Map.SmoothWheelZoom = L.Handler.extend({
 
         this._zoomAnimationId = requestAnimationFrame(this._updateWheelZoom.bind(this));
     }
-});
+} as any);
 
-L.Map.addInitHook('addHandler', 'smoothWheelZoom', L.Map.SmoothWheelZoom); 
+// Add the handler to the map
+L.Map.addInitHook('addHandler', 'smoothWheelZoom', SmoothWheelZoom); 
