@@ -115,4 +115,7 @@ const SmoothWheelZoom = L.Handler.extend({
 } as any);
 
 // Add the handler to the map
-L.Map.addInitHook('addHandler', 'smoothWheelZoom', SmoothWheelZoom); 
+L.Map.addInitHook('addHandler', 'smoothWheelZoom', SmoothWheelZoom);
+
+// Export the handler for use in other files
+export default SmoothWheelZoom; 
