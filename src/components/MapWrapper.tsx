@@ -59,9 +59,6 @@ if (typeof window !== 'undefined') {
 
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   require('leaflet-routing-machine');
-
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  require('../lib/leaflet-smooth-wheel-zoom');
 }
 
 interface MapWrapperProps {
@@ -205,13 +202,6 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
   // Update the waypoint change handler in the routing control setup
   useEffect(() => {
     if (!isMounted || !mapReady || !mapRef.current) return;
-
-    // Initialize smooth wheel zoom
-    const map = mapRef.current;
-    map.options.scrollWheelZoom = false;
-    map.options.smoothWheelZoom = true;
-    map.options.smoothSensitivity = 4;
-    map.smoothWheelZoom.enable();
 
     // Create new routing control
     const routingControl = L.Routing.control({
@@ -1040,7 +1030,7 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
         ref={(m: any) => { if(m){ mapRef.current = m; setMapReady(true);} }}
         dragging={true}
         zoomControl={true}
-        scrollWheelZoom={false}
+        scrollWheelZoom={true}
       >
         <TileLayer
           attribution={getTileLayerAttribution()}
