@@ -12,6 +12,15 @@ body {
   background: rgb(var(--background-rgb));
   margin: 0;
   padding: 0;
+  height: 100%;
+  overflow: hidden; /* Prevent page scroll; inner components manage their own scrolling */
+}
+
+html, #__next {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden; /* Ensure root elements don't introduce scroll bars */
 }
 
 .leaflet-container {

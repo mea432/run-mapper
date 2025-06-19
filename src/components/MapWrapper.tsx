@@ -102,6 +102,8 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
   // Share success state
   const [shareCopied, setShareCopied] = useState(false);
   const shareTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const [showSharePopup, setShowSharePopup] = useState(false);
+  const [shareLink, setShareLink] = useState('');
 
   // Loading indicator for long routes
   const [isRouteLoading, setIsRouteLoading] = useState(false);
@@ -353,6 +355,7 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
           mapRef.current.setView(coords, 15);
         }
         setShowWelcomePopup(false);
+        clearRoute();
       } else {
         alert('Location not found. Please try a different address.');
       }
@@ -451,21 +454,59 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
       alert('Geolocation is not supported by your browser.');
       return;
     }
-      navigator.geolocation.getCurrentPosition(
+
+    navigator.geolocation.getCurrentPosition(
       (pos) => {
         const coords: [number, number] = [pos.coords.latitude, pos.coords.longitude];
         setPosition(coords);
-        // Center map if already initialized
+        clearRoute();
+
         if (mapRef.current) {
           mapRef.current.setView(coords, 13);
         }
-        // Close popup if still open
+
         setShowWelcomePopup(false);
       },
-      (err) => {
-        console.error(err);
-        alert('Unable to retrieve your location.');
-      }
+      async (err) => {
+        console.error('Geolocation error:', err);
+
+        let message = 'Unable to retrieve your location.';
+        if (err && typeof err === 'object' && 'code' in err) {
+          switch ((err as GeolocationPositionError).code) {
+            case 1: // PERMISSION_DENIED
+              message = 'Location permission denied. Please enable it in your browser settings.';
+              break;
+            case 2: // POSITION_UNAVAILABLE
+              message = 'Location information is unavailable. Please try again later.';
+              break;
+            case 3: // TIMEOUT
+              message = 'Location request timed out. Please try again.';
+              break;
+          }
+        }
+
+        // Attempt fallback to IP-based lookup so user still gets approximate centering
+        try {
+          const res = await fetch('https://ipapi.co/json/');
+          const data = await res.json();
+          if (data && data.latitude && data.longitude) {
+            const coords: [number, number] = [parseFloat(data.latitude), parseFloat(data.longitude)];
+            setPosition(coords);
+            if (mapRef.current) {
+              mapRef.current.setView(coords, 6);
+            }
+            // Close popup so user can continue
+            setShowWelcomePopup(false);
+            alert(message + '\nShowing approximate location based on IP.');
+            return;
+          }
+        } catch (_) {
+          /* ignore fallback failure */
+        }
+
+        alert(message);
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 }
     );
   };
 
@@ -480,6 +521,7 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
           if (data && data.latitude && data.longitude) {
             const coords: [number, number] = [parseFloat(data.latitude), parseFloat(data.longitude)];
             setPosition(coords);
+            clearRoute();
             if (mapRef.current) {
               mapRef.current.setView(coords, 6); // Zoomed out to country-level
             }
@@ -1032,26 +1074,80 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
     }
   };
 
-  // Add share route function
+  // ---------- Share route helpers ----------
+  const copyShareLink = () => {
+    if (!shareLink) return;
+    const copyToClipboard = async (text: string) => {
+      try {
+        // Try using the Clipboard API first
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+          await navigator.clipboard.writeText(text);
+          return true;
+        }
+
+        // Fallback to textarea method
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        try {
+          document.execCommand('copy');
+          document.body.removeChild(textarea);
+          return true;
+        } catch (err) {
+          document.body.removeChild(textarea);
+          return false;
+        }
+      } catch (err) {
+        return false;
+      }
+    };
+
+    copyToClipboard(shareLink)
+      .then((success) => {
+        if (!success) {
+          alert('Failed to copy. Please try selecting and copying the link manually.');
+          return;
+        }
+        setShareCopied(true);
+        if (shareTimeoutRef.current) clearTimeout(shareTimeoutRef.current);
+        shareTimeoutRef.current = setTimeout(() => setShareCopied(false), 2000);
+      })
+      .catch((err) => {
+        console.error('Failed to copy:', err);
+        alert('Failed to copy share link. Please try again.');
+      });
+  };
+
+  const nativeShare = () => {
+    if (!shareLink) return;
+    if (navigator.share) {
+      navigator.share({
+        title: 'My Route',
+        url: shareLink,
+      }).catch((err) => {
+        // Gracefully handle user cancelling the share sheet
+        if (err && err.name !== 'AbortError') {
+          console.error('Native share failed:', err);
+        }
+      });
+    } else {
+      copyShareLink();
+    }
+  };
+
   const shareRoute = () => {
     if (waypoints.length === 0) {
       alert('Please create a route before sharing.');
       return;
     }
 
-    // Encode the waypoints data
     const routeData = encodeURIComponent(JSON.stringify(waypoints));
-    const shareUrl = `${window.location.origin}/route?route=${routeData}`;
-
-    // Copy to clipboard
-    navigator.clipboard.writeText(shareUrl).then(() => {
-      setShareCopied(true);
-      if (shareTimeoutRef.current) clearTimeout(shareTimeoutRef.current);
-      shareTimeoutRef.current = setTimeout(() => setShareCopied(false), 2000);
-    }).catch(err => {
-      console.error('Failed to copy:', err);
-      alert('Failed to copy share link. Please try again.');
-    });
+    const url = `${window.location.origin}/route?route=${routeData}`;
+    setShareLink(url);
+    setShowSharePopup(true);
   };
 
   // Clear timeout on unmount
@@ -1085,6 +1181,7 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
     setSuggestions([]);
     const coords: [number, number] = [parseFloat(item.lat), parseFloat(item.lon)];
     setPosition(coords);
+    clearRoute();
     if (mapRef.current) {
       mapRef.current.setView(coords, 15);
     }
@@ -1129,11 +1226,11 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
   };
 
   if (!isMounted) {
-    return <div style={{ height: '100vh', width: '100%' }}>Loading map...</div>;
+    return <div style={{ height: '100dvh', width: '100%', overflow: 'hidden' }}>Loading map...</div>;
   }
 
   return (
-    <div style={{ height: '100vh', width: '100%', position: 'relative' }}>
+    <div style={{ height: '100dvh', width: '100%', position: 'relative', overflow: 'hidden' }}>
       <style dangerouslySetInnerHTML={{ __html: `
         .leaflet-routing-container {
           display: none !important;
@@ -1914,6 +2011,117 @@ export default function MapWrapper({ initialWaypoints = [], viewOnly = false }: 
             </>
           )}
         </div>
+      )}
+
+      {/* Share Popup Modal */}
+      {showSharePopup && !viewOnly && (
+        <>
+          {/* Backdrop */}
+          <div
+            onClick={() => setShowSharePopup(false)}
+            style={{
+              position: 'fixed',
+              top: 0,
+              left: 0,
+              width: '100%',
+              height: '100%',
+              backgroundColor: 'rgba(0,0,0,0.4)',
+              backdropFilter: 'blur(2px)',
+              zIndex: 3000,
+            }}
+          />
+
+          {/* Modal */}
+          <div
+            style={{
+              position: 'fixed',
+              top: '50%',
+              left: '50%',
+              transform: 'translate(-50%, -50%)',
+              backgroundColor: 'white',
+              padding: '24px',
+              borderRadius: '12px',
+              boxShadow: '0 4px 16px rgba(0,0,0,0.25)',
+              zIndex: 3001,
+              width: 'min(90%, 420px)',
+              maxWidth: '420px',
+              fontFamily: 'var(--font-geist-sans)',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '16px',
+            }}
+          >
+            <h3 style={{ margin: 0 }}>Share this route</h3>
+
+            <input
+              type="text"
+              readOnly
+              value={shareLink}
+              onClick={(e) => (e.target as HTMLInputElement).select()}
+              style={{
+                width: '100%',
+                padding: '10px 12px',
+                border: '1px solid #ccc',
+                borderRadius: '8px',
+                fontSize: '14px',
+                boxSizing: 'border-box',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis'
+              }}
+            />
+
+            {shareCopied && (
+              <span style={{ color: '#4CAF50', fontSize: '14px' }}>Copied to clipboard!</span>
+            )}
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
+              <button
+                onClick={copyShareLink}
+                style={{
+                  padding: '10px 20px',
+                  backgroundColor: '#4CAF50',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '6px',
+                  cursor: 'pointer',
+                  fontSize: '14px',
+                }}
+              >
+                Copy
+              </button>
+              {typeof navigator !== 'undefined' && typeof navigator.share === 'function' && (
+                <button
+                  onClick={nativeShare}
+                  style={{
+                    padding: '10px 20px',
+                    backgroundColor: '#2196F3',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '6px',
+                    cursor: 'pointer',
+                    fontSize: '14px',
+                  }}
+                >
+                  Share
+                </button>
+              )}
+              <button
+                onClick={() => setShowSharePopup(false)}
+                style={{
+                  padding: '10px 20px',
+                  backgroundColor: '#e0e0e0',
+                  color: '#333',
+                  border: 'none',
+                  borderRadius: '6px',
+                  cursor: 'pointer',
+                  fontSize: '14px',
+                }}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </>
       )}
     </div>
   );
